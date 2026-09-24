@@ -36,8 +36,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Note: We removed the StaticFiles("/uploads") because we don't need local files anymore!
-
 @app.get("/api/patients", response_model=List[PatientStatusResponse])
 async def get_patients():
     cursor = patient_collection.find().sort("timestamp", -1)
@@ -75,14 +73,18 @@ async def whatsapp_webhook(
     NumMedia: int = Form(0),
     MediaUrl0: str = Form(None)
 ):
-    triage_color = await analyze_patient_update(text=Body, image_url=MediaUrl0)
+    # 1. Run AI Triage (now expects a dictionary back from the AI)
+    triage_result = await analyze_patient_update(text=Body, image_url=MediaUrl0)
     
+    # Extract the color, defaulting to Yellow if something went wrong
+    triage_color = triage_result.get("triage_color", "Yellow")
+    
+    # 2. Handle Image Upload to Cloudinary
     permanent_image_url = None
     if MediaUrl0:
         async with httpx.AsyncClient() as client:
             response = await client.get(MediaUrl0)
             if response.status_code == 200:
-                # NEW: Upload directly to Cloudinary from memory
                 try:
                     upload_result = cloudinary.uploader.upload(
                         response.content, 
@@ -92,16 +94,19 @@ async def whatsapp_webhook(
                 except Exception as e:
                     print("Cloudinary Upload Error:", e)
     
-    # Save to MongoDB
+    # 3. Save the richer dataset to MongoDB
     new_record = {
         "phone_number": From,
         "symptoms_text": Body,
         "media_url": permanent_image_url,
         "triage_color": triage_color,
+        "ai_detected_symptoms": triage_result.get("detected_symptoms", "Unknown"),
+        "ai_recommendation": triage_result.get("clinical_recommendation", "Review needed"),
         "timestamp": datetime.utcnow()
     }
     await patient_collection.insert_one(new_record)
     
+    # 4. Formulate the WhatsApp Reply based on the extracted color
     twiml = MessagingResponse()
     if triage_color == "Red":
         twiml.message("⚠️ We noticed some warning signs. A doctor has been notified and will contact you shortly. Please rest.")
